@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -144,6 +146,12 @@ func RelayImageHelper(c *gin.Context, relayMode int) *relaymodel.ErrorWithStatus
 		requestBody = bytes.NewBuffer(jsonStr)
 	} else {
 		requestBody = c.Request.Body
+		if relayMode == relaymode.ImagesEdits && isModelMapped {
+			requestBody, err = rewriteImageEditModel(c, imageRequest.Model)
+			if err != nil {
+				return openai.ErrorWrapper(err, "rewrite_image_request_failed", http.StatusBadRequest)
+			}
+		}
 	}
 
 	adaptor := relay.GetAdaptor(meta.APIType)
@@ -236,4 +244,53 @@ func RelayImageHelper(c *gin.Context, relayMode int) *relaymodel.ErrorWithStatus
 	}
 
 	return nil
+}
+
+func rewriteImageEditModel(c *gin.Context, modelName string) (io.Reader, error) {
+	body, err := common.GetRequestBody(c)
+	if err != nil {
+		return nil, err
+	}
+	_, params, err := mime.ParseMediaType(c.Request.Header.Get("Content-Type"))
+	if err != nil || params["boundary"] == "" {
+		return nil, errors.New("invalid multipart content type")
+	}
+	reader := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	var output bytes.Buffer
+	writer := multipart.NewWriter(&output)
+	modelWritten := false
+	for {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return nil, nextErr
+		}
+		newPart, partErr := writer.CreatePart(part.Header)
+		if partErr != nil {
+			return nil, partErr
+		}
+		if part.FormName() == "model" {
+			_, partErr = io.WriteString(newPart, modelName)
+			modelWritten = true
+		} else {
+			_, partErr = io.Copy(newPart, part)
+		}
+		if partErr != nil {
+			return nil, partErr
+		}
+	}
+	if !modelWritten {
+		if err = writer.WriteField("model", modelName); err != nil {
+			return nil, err
+		}
+	}
+	if err = writer.Close(); err != nil {
+		return nil, err
+	}
+	c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+	requestBody := output.Bytes()
+	c.Request.Body = io.NopCloser(bytes.NewReader(requestBody))
+	return bytes.NewReader(requestBody), nil
 }

@@ -1,11 +1,13 @@
 package middleware
 
 import (
+	"bytes"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/songquanpeng/one-api/common"
 	"github.com/songquanpeng/one-api/common/helper"
 	"github.com/songquanpeng/one-api/common/logger"
+	"io"
 	"strings"
 )
 
@@ -26,6 +28,17 @@ func getRequestModel(c *gin.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("common.UnmarshalBodyReusable failed: %w", err)
 	}
+	// Image edit requests are multipart/form-data. Some clients are not
+	// handled consistently by Gin's generic form binder, so read model from
+	// the parsed multipart form as a fallback and restore the cached body.
+	if modelRequest.Model == "" && strings.HasPrefix(c.GetHeader("Content-Type"), "multipart/form-data") {
+		if err := c.Request.ParseMultipartForm(32 << 20); err == nil {
+			modelRequest.Model = c.Request.FormValue("model")
+		}
+		if body, bodyErr := common.GetRequestBody(c); bodyErr == nil {
+			c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		}
+	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/moderations") {
 		if modelRequest.Model == "" {
 			modelRequest.Model = "text-moderation-stable"
@@ -37,6 +50,11 @@ func getRequestModel(c *gin.Context) (string, error) {
 		}
 	}
 	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/generations") {
+		if modelRequest.Model == "" {
+			modelRequest.Model = "dall-e-2"
+		}
+	}
+	if strings.HasPrefix(c.Request.URL.Path, "/v1/images/edits") {
 		if modelRequest.Model == "" {
 			modelRequest.Model = "dall-e-2"
 		}
