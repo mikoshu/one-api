@@ -19,6 +19,12 @@ import {
   DialogTitle,
   Tooltip,
   Button,
+  FormControl,
+  InputLabel,
+  Select,
+  Typography,
+  Box,
+  CircularProgress,
 } from "@mui/material";
 
 import Label from "ui-component/Label";
@@ -38,6 +44,13 @@ export default function ChannelTableRow({
 }) {
   const [open, setOpen] = useState(null);
   const [openDelete, setOpenDelete] = useState(false);
+  const [openTest, setOpenTest] = useState(false);
+  const [testModel, setTestModel] = useState(item.models.split(',').filter(Boolean)[0] || '');
+  const [testMode, setTestMode] = useState('chat');
+  const [testPrompt, setTestPrompt] = useState('你好，请简短介绍一下你自己。');
+  const [testImage, setTestImage] = useState('');
+  const [testResult, setTestResult] = useState(null);
+  const [testing, setTesting] = useState(false);
   const [statusSwitch, setStatusSwitch] = useState(item.status);
   const [priorityValve, setPriority] = useState(item.priority);
   const [responseTimeData, setResponseTimeData] = useState({
@@ -86,15 +99,48 @@ export default function ChannelTableRow({
     setPriority(currentValue);
   };
 
-  const handleResponseTime = async () => {
-    const { success, time } = await manageChannel(item.id, "test", "");
-    if (success) {
-      setResponseTimeData({
-        test_time: Date.now() / 1000,
-        response_time: time * 1000,
-      });
-      showInfo(`渠道 ${item.name} 测试成功，耗时 ${time.toFixed(2)} 秒。`);
+  const handleResponseTime = () => {
+    setTestResult(null);
+    setOpenTest(true);
+  };
+
+  const runTest = async () => {
+    if (testMode === 'image_edit' && !testImage) {
+      showError('请先选择要修改的图片');
+      return;
     }
+    setTesting(true);
+    try {
+      const res = await API.post(`/api/channel/test/${item.id}`, {
+        model: testModel,
+        mode: testMode,
+        prompt: testPrompt,
+        image: testImage,
+      });
+      const { success, time, message, response, rawResponse, imageUrls } = res.data;
+      setTestResult({ success, message, response, rawResponse, imageUrls: imageUrls || [], time });
+      if (success) {
+        setResponseTimeData({
+          test_time: Date.now() / 1000,
+          response_time: time * 1000,
+        });
+        showInfo(`渠道 ${item.name} 测试成功，耗时 ${time.toFixed(2)} 秒。`);
+      } else {
+        showError(message);
+      }
+    } catch (error) {
+      showError(error);
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const handleTestImage = (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => setTestImage(reader.result);
+    reader.readAsDataURL(file);
   };
 
   const updateChannelBalance = async () => {
@@ -228,6 +274,50 @@ export default function ChannelTableRow({
           删除
         </MenuItem>
       </Popover>
+
+      <Dialog open={openTest} onClose={() => setOpenTest(false)} fullWidth maxWidth="sm">
+        <DialogTitle>选择测试模型</DialogTitle>
+        <DialogContent dividers>
+          <FormControl fullWidth margin="dense">
+            <InputLabel id={`test-model-label-${item.id}`}>模型</InputLabel>
+            <Select labelId={`test-model-label-${item.id}`} value={testModel} label="模型" onChange={(event) => setTestModel(event.target.value)}>
+              {item.models.split(',').filter(Boolean).map((model) => <MenuItem key={model} value={model}>{model}</MenuItem>)}
+            </Select>
+          </FormControl>
+          <FormControl fullWidth margin="dense">
+            <InputLabel id={`test-mode-label-${item.id}`}>测试类型</InputLabel>
+            <Select labelId={`test-mode-label-${item.id}`} value={testMode} label="测试类型" onChange={(event) => setTestMode(event.target.value)}>
+              <MenuItem value="chat">文字对话</MenuItem>
+              <MenuItem value="image_generation">生图</MenuItem>
+              <MenuItem value="image_edit">改图</MenuItem>
+            </Select>
+          </FormControl>
+          <TextField
+            fullWidth
+            multiline
+            minRows={3}
+            margin="dense"
+            label="测试内容"
+            value={testPrompt}
+            onChange={(event) => setTestPrompt(event.target.value)}
+          />
+          {testMode === 'image_edit' && (
+            <TextField fullWidth type="file" margin="dense" onChange={handleTestImage} inputProps={{ accept: 'image/*' }} InputLabelProps={{ shrink: true }} label="待修改图片" />
+          )}
+          {testResult && (
+            <Box sx={{ mt: 2 }}>
+              <Typography variant="subtitle1">发送内容</Typography>
+              <Box component="pre" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', p: 1, bgcolor: 'grey.100', borderRadius: 1 }}>{testPrompt}</Box>
+              <Typography variant="subtitle1">返回结果</Typography>
+              {testResult.imageUrls.length > 0 ? testResult.imageUrls.map((src) => <Box key={src} component="img" src={src} alt="测试结果" sx={{ maxWidth: '100%', maxHeight: 360, display: 'block', mb: 1 }} />) : <Box component="pre" sx={{ whiteSpace: 'pre-wrap', wordBreak: 'break-word', p: 1, bgcolor: 'grey.100', borderRadius: 1 }}>{testResult.response || testResult.rawResponse || testResult.message}</Box>}
+            </Box>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setOpenTest(false)}>取消</Button>
+          <Button variant="contained" onClick={runTest} disabled={!testModel || testing}>{testing && <CircularProgress size={16} sx={{ mr: 1 }} />}测试</Button>
+        </DialogActions>
+      </Dialog>
 
       <Dialog open={openDelete} onClose={handleDeleteClose}>
         <DialogTitle>删除渠道</DialogTitle>

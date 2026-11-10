@@ -1,5 +1,5 @@
 import PropTypes from 'prop-types';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { CHANNEL_OPTIONS } from 'constants/ChannelConstants';
 import { useTheme } from '@mui/material/styles';
 import { API } from 'utils/api';
@@ -22,7 +22,9 @@ import {
   Autocomplete,
   FormHelperText,
   Switch,
-  Checkbox
+  Checkbox,
+  FormControlLabel,
+  CircularProgress
 } from '@mui/material';
 
 import { Formik } from 'formik';
@@ -78,6 +80,11 @@ const EditModal = ({ open, channelId, onCancel, onOk }) => {
   const [modelOptions, setModelOptions] = useState([]);
   const [batchAdd, setBatchAdd] = useState(false);
   const [basicModels, setBasicModels] = useState([]);
+  const [remoteModelDialog, setRemoteModelDialog] = useState(false);
+  const [remoteModels, setRemoteModels] = useState([]);
+  const [remoteSelectedModels, setRemoteSelectedModels] = useState([]);
+  const [remoteLoading, setRemoteLoading] = useState(false);
+  const setFieldValueRef = useRef(null);
 
   const initChannel = (typeValue) => {
     if (typeConfig[typeValue]?.inputLabel) {
@@ -148,6 +155,33 @@ const EditModal = ({ open, channelId, onCancel, onOk }) => {
       );
     } catch (error) {
       showError(error.message);
+    }
+  };
+
+  const fetchRemoteModels = async (values) => {
+    setRemoteLoading(true);
+    try {
+      const res = await API.post('/api/channel/models', {
+        type: values.type,
+        base_url: values.base_url,
+        key: values.key
+      });
+      if (!res.data.success) {
+        showError(res.data.message);
+        return;
+      }
+      const models = (res.data.data || []).map((model) => ({ id: model.id, group: model.owned_by || '上游模型' }));
+      if (models.length === 0) {
+        showError('上游没有返回可用模型');
+        return;
+      }
+      setRemoteModels(models);
+      setRemoteSelectedModels(models.map((model) => model.id));
+      setRemoteModelDialog(true);
+    } catch (error) {
+      showError(error);
+    } finally {
+      setRemoteLoading(false);
     }
   };
 
@@ -283,6 +317,9 @@ const EditModal = ({ open, channelId, onCancel, onOk }) => {
       <DialogContent>
         <Formik initialValues={initialInput} enableReinitialize validationSchema={validationSchema} onSubmit={submit}>
           {({ errors, handleBlur, handleChange, handleSubmit, isSubmitting, touched, values, setFieldValue }) => (
+            (() => {
+              setFieldValueRef.current = setFieldValue;
+              return (
             <form noValidate onSubmit={handleSubmit}>
               <FormControl fullWidth error={Boolean(touched.type && errors.type)} sx={{ ...theme.typography.otherInput }}>
                 <InputLabel htmlFor="channel-type-label">{inputLabel.type}</InputLabel>
@@ -486,6 +523,13 @@ const EditModal = ({ open, channelId, onCancel, onOk }) => {
               >
                 <ButtonGroup variant="outlined" aria-label="small outlined primary button group">
                   <Button
+                    disabled={remoteLoading}
+                    onClick={() => fetchRemoteModels(values)}
+                  >
+                    {remoteLoading && <CircularProgress size={16} sx={{ mr: 1 }} />}
+                    从渠道获取模型
+                  </Button>
+                  <Button
                     onClick={() => {
                       setFieldValue('models', initialModel(basicModels));
                     }}
@@ -624,9 +668,57 @@ const EditModal = ({ open, channelId, onCancel, onOk }) => {
                 </Button>
               </DialogActions>
             </form>
+              );
+            })()
           )}
         </Formik>
       </DialogContent>
+      <Dialog open={remoteModelDialog} onClose={() => setRemoteModelDialog(false)} fullWidth maxWidth="sm">
+        <DialogTitle>选择渠道模型</DialogTitle>
+        <DialogContent dividers>
+          <FormControlLabel
+            control={
+              <Checkbox
+                checked={remoteModels.length > 0 && remoteSelectedModels.length === remoteModels.length}
+                indeterminate={remoteSelectedModels.length > 0 && remoteSelectedModels.length < remoteModels.length}
+                onChange={(event) => setRemoteSelectedModels(event.target.checked ? remoteModels.map((model) => model.id) : [])}
+              />
+            }
+            label="全选"
+          />
+          {remoteModels.map((model) => (
+            <FormControlLabel
+              key={model.id}
+              control={
+                <Checkbox
+                  checked={remoteSelectedModels.includes(model.id)}
+                  onChange={(event) => {
+                    setRemoteSelectedModels((selected) =>
+                      event.target.checked ? [...selected, model.id] : selected.filter((id) => id !== model.id)
+                    );
+                  }}
+                />
+              }
+              label={model.id}
+              sx={{ display: 'flex' }}
+            />
+          ))}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setRemoteModelDialog(false)}>取消</Button>
+          <Button
+            variant="contained"
+            disabled={remoteSelectedModels.length === 0}
+            onClick={() => {
+              const selected = remoteModels.filter((model) => remoteSelectedModels.includes(model.id));
+              setFieldValueRef.current('models', selected);
+              setRemoteModelDialog(false);
+            }}
+          >
+            填入已选模型
+          </Button>
+        </DialogActions>
+      </Dialog>
     </Dialog>
   );
 };

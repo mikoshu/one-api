@@ -108,7 +108,7 @@ export default function ChannelPage() {
         });
         break;
       case 'test':
-        res = await API.get(url + `test/${id}`);
+        res = await API.get(url + `test/${id}${value ? `?model=${encodeURIComponent(value)}` : ''}`);
         break;
     }
     const { success, message } = res.data;

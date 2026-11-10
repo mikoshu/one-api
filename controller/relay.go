@@ -27,6 +27,8 @@ func relayHelper(c *gin.Context, relayMode int) *model.ErrorWithStatusCode {
 	var err *model.ErrorWithStatusCode
 	switch relayMode {
 	case relaymode.ImagesGenerations:
+		fallthrough
+	case relaymode.ImagesEdits:
 		err = controller.RelayImageHelper(c, relayMode)
 	case relaymode.AudioSpeech:
 		fallthrough

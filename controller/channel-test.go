@@ -3,10 +3,12 @@ package controller
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -211,6 +213,161 @@ func TestChannel(c *gin.Context) {
 		"modelName": modelName,
 	})
 	return
+}
+
+type InteractiveChannelTestRequest struct {
+	Model  string `json:"model"`
+	Mode   string `json:"mode"`
+	Prompt string `json:"prompt"`
+	Image  string `json:"image"` // base64 or data URL, used by image edits
+}
+
+// TestChannelInteractive runs a one-off administrator test without consuming
+// a user's quota. It returns the request fields and the upstream response so
+// the dashboard can show exactly what was tested.
+func TestChannelInteractive(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	channel, err := model.GetChannelById(id, true)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	var input InteractiveChannelTestRequest
+	if err = c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusOK, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if input.Model == "" {
+		input.Model = strings.Split(channel.Models, ",")[0]
+	}
+	if input.Prompt == "" {
+		input.Prompt = config.TestPrompt
+	}
+	if input.Mode == "" {
+		input.Mode = "chat"
+	}
+	start := time.Now()
+	var response string
+	var rawResponse string
+	var imageURLs []string
+	if input.Mode == "image_generation" || input.Mode == "image_edit" {
+		response, rawResponse, imageURLs, err = testImageChannel(c.Request.Context(), channel, &input)
+	} else {
+		request := buildTestRequest(input.Model)
+		request.Messages[0].Content = input.Prompt
+		response, err, _ = testChannel(c.Request.Context(), channel, request)
+		rawResponse = response
+	}
+	result := gin.H{
+		"success":     err == nil,
+		"time":        time.Since(start).Seconds(),
+		"modelName":   input.Model,
+		"mode":        input.Mode,
+		"request":     input.Prompt,
+		"response":    response,
+		"rawResponse": rawResponse,
+		"imageUrls":   imageURLs,
+	}
+	if err != nil {
+		result["message"] = err.Error()
+	} else {
+		result["message"] = ""
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func testImageChannel(ctx context.Context, channel *model.Channel, input *InteractiveChannelTestRequest) (string, string, []string, error) {
+	path := "/v1/images/generations"
+	if input.Mode == "image_edit" {
+		path = "/v1/images/edits"
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = &http.Request{Method: http.MethodPost, URL: &url.URL{Path: path}, Header: make(http.Header)}
+	c.Request.Header.Set("Authorization", "Bearer "+channel.Key)
+	c.Set(ctxkey.Channel, channel.Type)
+	c.Set(ctxkey.BaseURL, channel.GetBaseURL())
+	cfg, _ := channel.LoadConfig()
+	c.Set(ctxkey.Config, cfg)
+	middleware.SetupContextForSelectedChannel(c, channel, "")
+	meta := meta.GetByContext(c)
+	meta.OriginModelName = input.Model
+	meta.ActualModelName = input.Model
+	if mapped := channel.GetModelMapping(); mapped != nil && mapped[input.Model] != "" {
+		meta.ActualModelName = mapped[input.Model]
+	}
+	apiType := channeltype.ToAPIType(channel.Type)
+	adaptor := relay.GetAdaptor(apiType)
+	if adaptor == nil {
+		return "", "", nil, fmt.Errorf("invalid api type: %d, adaptor is nil", apiType)
+	}
+	adaptor.Init(meta)
+	var body io.Reader
+	if input.Mode == "image_edit" {
+		var buffer bytes.Buffer
+		writer := multipart.NewWriter(&buffer)
+		_ = writer.WriteField("model", meta.ActualModelName)
+		_ = writer.WriteField("prompt", input.Prompt)
+		imageData := input.Image
+		if comma := strings.Index(imageData, ","); comma >= 0 {
+			imageData = imageData[comma+1:]
+		}
+		decoded, err := base64.StdEncoding.DecodeString(imageData)
+		if err != nil {
+			return "", "", nil, fmt.Errorf("图片数据无效: %w", err)
+		}
+		part, err := writer.CreateFormFile("image", "test.png")
+		if err != nil {
+			return "", "", nil, err
+		}
+		if _, err = part.Write(decoded); err != nil {
+			return "", "", nil, err
+		}
+		if err = writer.Close(); err != nil {
+			return "", "", nil, err
+		}
+		c.Request.Header.Set("Content-Type", writer.FormDataContentType())
+		requestBytes := buffer.Bytes()
+		c.Request.Body = io.NopCloser(bytes.NewReader(requestBytes))
+		body = bytes.NewReader(requestBytes)
+	} else {
+		payload, err := json.Marshal(relaymodel.ImageRequest{Model: meta.ActualModelName, Prompt: input.Prompt, N: 1, Size: "1024x1024"})
+		if err != nil {
+			return "", "", nil, err
+		}
+		c.Request.Header.Set("Content-Type", "application/json")
+		c.Request.Body = io.NopCloser(bytes.NewReader(payload))
+		body = bytes.NewReader(payload)
+	}
+	resp, err := adaptor.DoRequest(c, meta, body)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		upstreamErr := controller.RelayErrorHandler(resp)
+		return "", "", nil, fmt.Errorf("http status code: %d: %s", resp.StatusCode, upstreamErr.Error.Message)
+	}
+	if _, responseErr := adaptor.DoResponse(c, resp, meta); responseErr != nil {
+		return "", "", nil, errors.New(responseErr.Error.Message)
+	}
+	raw := w.Body.String()
+	var parsed openai.ImageResponse
+	if err = json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return raw, raw, nil, nil
+	}
+	urls := make([]string, 0, len(parsed.Data))
+	for _, item := range parsed.Data {
+		if item.Url != "" {
+			urls = append(urls, item.Url)
+		} else if item.B64Json != "" {
+			urls = append(urls, "data:image/png;base64,"+item.B64Json)
+		}
+	}
+	return raw, raw, urls, nil
 }
 
 var testAllChannelsLock sync.Mutex

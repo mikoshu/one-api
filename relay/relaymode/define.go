@@ -8,6 +8,7 @@ const (
 	Moderations
 	ImagesGenerations
 	Edits
+	ImagesEdits
 	AudioSpeech
 	AudioTranscription
 	AudioTranslation

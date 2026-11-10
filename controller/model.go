@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"encoding/json"
 	"fmt"
 	"github.com/gin-gonic/gin"
 	"github.com/songquanpeng/one-api/common/ctxkey"
@@ -11,7 +12,9 @@ import (
 	"github.com/songquanpeng/one-api/relay/channeltype"
 	"github.com/songquanpeng/one-api/relay/meta"
 	relaymodel "github.com/songquanpeng/one-api/relay/model"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -127,6 +130,82 @@ func ListAllModels(c *gin.Context) {
 		"object": "list",
 		"data":   models,
 	})
+}
+
+type ChannelModelsRequest struct {
+	Type    int    `json:"type"`
+	BaseURL string `json:"base_url"`
+	Key     string `json:"key"`
+}
+
+// FetchChannelModels queries an OpenAI-compatible upstream using the credentials
+// currently entered in the channel form. It intentionally does not persist them.
+func FetchChannelModels(c *gin.Context) {
+	var input ChannelModelsRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	baseURL := strings.TrimRight(input.BaseURL, "/")
+	if baseURL == "" {
+		if input.Type <= channeltype.Unknown || input.Type >= channeltype.Dummy {
+			c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "无效的渠道类型"})
+			return
+		}
+		baseURL = channeltype.ChannelBaseURLs[input.Type]
+	}
+	if baseURL == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": "渠道 API 地址不能为空"})
+		return
+	}
+	path := "/v1/models"
+	if input.Type == channeltype.OpenAICompatible || strings.HasSuffix(baseURL, "/v1") {
+		path = "/models"
+	}
+	endpoint, err := url.JoinPath(baseURL, path)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, endpoint, nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	if input.Type == channeltype.Azure {
+		req.Header.Set("api-key", input.Key)
+	} else {
+		req.Header.Set("Authorization", "Bearer "+input.Key)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": fmt.Sprintf("上游返回 HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))})
+		return
+	}
+	var result struct {
+		Data []struct {
+			Id      string `json:"id"`
+			OwnedBy string `json:"owned_by"`
+		} `json:"data"`
+	}
+	if err = json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"success": false, "message": "无法解析上游模型列表: " + err.Error()})
+		return
+	}
+	models := make([]OpenAIModels, 0, len(result.Data))
+	for _, item := range result.Data {
+		if item.Id == "" {
+			continue
+		}
+		models = append(models, OpenAIModels{Id: item.Id, Object: "model", OwnedBy: item.OwnedBy})
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "", "data": models})
 }
 
 func ListModels(c *gin.Context) {
